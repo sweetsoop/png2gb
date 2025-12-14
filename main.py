@@ -2,6 +2,7 @@ from collections import Counter
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+from PIL.PngImagePlugin import PngInfo
 from skimage.metrics import structural_similarity as ssim
 import numpy as np
 from scipy.spatial import cKDTree
@@ -12,6 +13,8 @@ import os
 import zipfile
 import threading
 import time
+import tempfile
+import uuid
 from sklearn.cluster import KMeans
 from skimage.color import rgb2lab, lab2rgb  # For color space conversion
 from sklearn.cluster import KMeans
@@ -554,13 +557,56 @@ def downscale_image(image: Image, new_width: int, new_height: int, keep_aspect_r
 
 
 def limit_colors(image, limit=16, quantize=None, dither=None, palette_image=None):
+    # 사용 가능한 quantization 메서드 확인 및 대체
+    available_methods = [
+        Image.Quantize.MEDIANCUT,
+        Image.Quantize.MAXCOVERAGE,
+        Image.Quantize.FASTOCTREE,
+        Image.Quantize.LIBIMAGEQUANT
+    ]
+    
+    # 선택된 메서드가 사용 불가능하면 대체 메서드 시도
+    method_to_use = quantize
+    if method_to_use is None:
+        method_to_use = Image.Quantize.MEDIANCUT
+    
     if palette_image:
         ppalette = palette_image.getcolors()
-        color_palette = palette_image.quantize(colors=len(list(set(ppalette))))
+        try:
+            color_palette = palette_image.quantize(colors=len(list(set(ppalette))), method=method_to_use)
+        except (ValueError, OSError):
+            # 선택된 메서드가 실패하면 다른 메서드 시도
+            for method in available_methods:
+                try:
+                    color_palette = palette_image.quantize(colors=len(list(set(ppalette))), method=method)
+                    break
+                except (ValueError, OSError):
+                    continue
+            else:
+                # 모든 메서드가 실패하면 기본 메서드 사용 (method 파라미터 없이)
+                color_palette = palette_image.quantize(colors=len(list(set(ppalette))))
     else:
-        color_palette = image.quantize(colors=limit, kmeans=limit if limit else 0, method=quantize,
-                                       dither=dither)
-    image = image.quantize(palette=color_palette, dither=dither)
+        try:
+            color_palette = image.quantize(colors=limit, kmeans=limit if limit else 0, method=method_to_use,
+                                           dither=dither)
+        except (ValueError, OSError):
+            # 선택된 메서드가 실패하면 다른 메서드 시도
+            for method in available_methods:
+                try:
+                    color_palette = image.quantize(colors=limit, kmeans=limit if limit else 0, method=method,
+                                                   dither=dither)
+                    break
+                except (ValueError, OSError):
+                    continue
+            else:
+                # 모든 메서드가 실패하면 기본 메서드 사용 (method 파라미터 없이)
+                color_palette = image.quantize(colors=limit, kmeans=limit if limit else 0, dither=dither)
+    
+    try:
+        image = image.quantize(palette=color_palette, dither=dither)
+    except (ValueError, OSError):
+        # dither가 문제일 수 있으므로 dither 없이 시도
+        image = image.quantize(palette=color_palette)
     return image
 
 
@@ -617,7 +663,7 @@ def adjust_for_aspect_ratio(keep_aspect, current_width, current_height):
 
 def create_gradio_interface():
     header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script>'
-    with gr.Blocks(head=header) as demo:
+    with gr.Blocks() as demo:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
@@ -643,7 +689,7 @@ def create_gradio_interface():
                                                                  maximum=0.99, value=0.8, step=0.01, visible=False)
                 with gr.Row():
                     quantization_method = gr.Dropdown(choices=list(QUANTIZATION_METHODS.keys()),
-                                                      label="Quantization Method", value="libimagequant")
+                                                      label="Quantization Method", value="Median cut")
                     dither_method = gr.Dropdown(choices=list(DITHER_METHODS.keys()), label="Dither Method",
                                                 value="None")
                 with gr.Group():
@@ -670,18 +716,18 @@ def create_gradio_interface():
                                                           value=128, visible=False)
 
 
-                is_black_and_white.change(lambda x: gr.update('black_and_white_threshold', visible=x),
+                is_black_and_white.change(lambda x: gr.update(visible=x),
                                           inputs=[is_black_and_white], outputs=[black_and_white_threshold])
 
                 # Logic to capture and display original image dimensions
                 def capture_original_dimensions(image):
                     # Update the global variables with the dimensions of the uploaded image
                     if image is None:
-                        return None
+                        return
                     width, height = image.size
                     original_width.value = width
                     original_height.value = height
-                    return image  # Return unchanged image for further processing
+                    return  # No output needed
 
                 def limit_4_colors_per_tile_change(x):
                     quantize_for_GBC.value = x
@@ -699,7 +745,7 @@ def create_gradio_interface():
                 image_input.change(
                     fn=capture_original_dimensions,
                     inputs=[image_input],
-                    outputs=[image_input]
+                    outputs=[]
                 )
 
                 def on_logo_resolution_click():
@@ -724,15 +770,24 @@ def create_gradio_interface():
                 )
 
                 # Dynamic updates based on aspect ratio checkbox and width changes
+                # Aspect ratio 조정 - keep_aspect_ratio 변경 시에만 작동
                 keep_aspect_ratio.change(
                     fn=adjust_for_aspect_ratio,
                     inputs=[keep_aspect_ratio, new_width, new_height],
                     outputs=[new_width, new_height]
                 )
+                # new_width 변경 시 aspect ratio 조정 (new_height만 업데이트)
+                def adjust_height_for_width(keep_aspect, current_width, current_height):
+                    if keep_aspect and original_width.value and original_height.value:
+                        aspect_ratio = original_width.value / original_height.value
+                        new_height = int(current_width / aspect_ratio)
+                        return new_height
+                    return current_height
+                
                 new_width.change(
-                    fn=adjust_for_aspect_ratio,
+                    fn=adjust_height_for_width,
                     inputs=[keep_aspect_ratio, new_width, new_height],
-                    outputs=[new_width, new_height]
+                    outputs=[new_height]
                 )
 
             with gr.Column():
@@ -752,16 +807,19 @@ def create_gradio_interface():
                     with gr.Row():
                         with gr.Column():
                             palette_text = gr.Textbox(label="Custom Palette Info", value="None", interactive=False,
-                                                  show_copy_button=True, lines=4, max_lines=4, autoscroll=False)
+                                                  lines=4, max_lines=4, autoscroll=False)
                 with gr.Row():
                     execute_button = gr.Button("Convert Image")
                     execute_button_folder = gr.Button("Convert Folder")
+                with gr.Row():
+                    image_output_png = gr.File(label="Download Output Image (PNG)", type="filepath")
+                    image_output_palette_png = gr.File(label="Download Palette Image (PNG)", type="filepath")
                 image_output_zip = gr.File(label="Output Folder Zip", type="filepath")
 
-        reduce_tile_checkbox.change(lambda x: gr.update('reduce_tile_checkbox', visible=x),
+        reduce_tile_checkbox.change(lambda x: gr.update(visible=x),
                                     inputs=[reduce_tile_checkbox], outputs=[reduce_tile_similarity_threshold])
 
-        use_custom_palette.change(lambda x: gr.update('palette_image', visible=x),
+        use_custom_palette.change(lambda x: gr.update(visible=x),
                                   inputs=[use_custom_palette], outputs=[palette_image])
 
         def extract_tiles(image, tile_size=(8, 8)):
@@ -1331,8 +1389,39 @@ def create_gradio_interface():
                     image = image.convert("RGB")
                 if image_for_reference_palette.mode != "RGB":
                     image_for_reference_palette = image_for_reference_palette.convert("RGB")
-
-                return image, text_for_palette, image_for_reference_palette, notice
+                
+                # PNG 파일로 저장하여 다운로드 가능하게 함
+                temp_dir = tempfile.gettempdir()
+                unique_id = str(uuid.uuid4())
+                png_output_path = os.path.join(temp_dir, f"png2gb_output_{unique_id}.png")
+                png_palette_path = os.path.join(temp_dir, f"png2gb_palette_{unique_id}.png")
+                
+                # 메타데이터 생성
+                from datetime import datetime
+                metadata = PngInfo()
+                metadata.add_text("Software", "png2gb - Game Boy Image Converter")
+                metadata.add_text("Creation Time", datetime.now().isoformat())
+                metadata.add_text("Image Width", str(image.width))
+                metadata.add_text("Image Height", str(image.height))
+                metadata.add_text("Color Limit", str(num_colors) if color_limit else "None")
+                metadata.add_text("Quantization Method", quant_method)
+                metadata.add_text("Dither Method", dither_method)
+                metadata.add_text("Gothic Filter", "Enabled" if enable_gothic_filter else "Disabled")
+                if text_for_palette:
+                    metadata.add_text("Palette Info", text_for_palette[:500])  # PNG 텍스트 청크 크기 제한
+                
+                image.save(png_output_path, format='PNG', pnginfo=metadata)
+                if image_for_reference_palette is not None:
+                    palette_metadata = PngInfo()
+                    palette_metadata.add_text("Software", "png2gb - Game Boy Image Converter")
+                    palette_metadata.add_text("Creation Time", datetime.now().isoformat())
+                    palette_metadata.add_text("Image Type", "Palette Reference")
+                    palette_metadata.add_text("Image Width", str(image_for_reference_palette.width))
+                    palette_metadata.add_text("Image Height", str(image_for_reference_palette.height))
+                    image_for_reference_palette.save(png_palette_path, format='PNG', pnginfo=palette_metadata)
+                    return image, text_for_palette, image_for_reference_palette, notice, png_output_path, png_palette_path
+                else:
+                    return image, text_for_palette, image_for_reference_palette, notice, png_output_path, None
 
             if grayscale:
                 image = convert_to_grayscale(image)
@@ -1340,10 +1429,35 @@ def create_gradio_interface():
                 image = convert_to_black_and_white(image, threshold=bw_threshold)
             if reduce_tile_flag:
                 image, notice = reduce_tiles(image, similarity_threshold=reduce_tile_threshold)
+            
+            # PNG 파일로 저장하여 다운로드 가능하게 함
+            temp_dir = tempfile.gettempdir()
+            unique_id = str(uuid.uuid4())
+            png_output_path = os.path.join(temp_dir, f"png2gb_output_{unique_id}.png")
+            
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            
+            # 메타데이터 생성
+            from datetime import datetime
+            metadata = PngInfo()
+            metadata.add_text("Software", "png2gb - Game Boy Image Converter")
+            metadata.add_text("Creation Time", datetime.now().isoformat())
+            metadata.add_text("Image Width", str(image.width))
+            metadata.add_text("Image Height", str(image.height))
+            if grayscale:
+                metadata.add_text("Processing", "Grayscale conversion applied")
+            if black_and_white:
+                metadata.add_text("Processing", f"Black and white conversion applied (threshold: {bw_threshold})")
+            if reduce_tile_flag:
+                metadata.add_text("Processing", f"Tile reduction applied (threshold: {reduce_tile_threshold})")
+            
+            image.save(png_output_path, format='PNG', pnginfo=metadata)
+            
             return (
                 image,
                 text_for_palette, None,
-                None
+                None, png_output_path, None
             )
 
         def process_image_folder(input_files, width, height, aspect_ratio, color_limit, num_colors, quant_method, dither_method,
@@ -1366,8 +1480,38 @@ def create_gradio_interface():
                                            use_palette, custom_palette, grayscale, black_and_white, bw_threshold, reduce_tile_flag,
                                            reduce_tile_threshold, limit_4_colors_per_tile, enable_gothic_filter, brightness_threshold, dot_size, spacing, contrast_boost,
                                            noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size)
-                    result[0].save(os.path.join(folder_name, os.path.basename(input_files[index].name)))
-                    result[2].save(os.path.join(folder_name, os.path.basename(input_files[index].name).replace(".png", "_palette.png").replace(".jpg", "_palette.jpg")))
+                    # PNG 형식으로 명시적으로 저장
+                    output_filename = os.path.basename(input_files[index].name)
+                    # 확장자를 .png로 변경
+                    if output_filename.lower().endswith(('.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                        output_filename = os.path.splitext(output_filename)[0] + '.png'
+                    elif not output_filename.lower().endswith('.png'):
+                        output_filename = os.path.splitext(output_filename)[0] + '.png'
+                    
+                    # 메타데이터 생성
+                    from datetime import datetime
+                    metadata = PngInfo()
+                    metadata.add_text("Software", "png2gb - Game Boy Image Converter")
+                    metadata.add_text("Creation Time", datetime.now().isoformat())
+                    metadata.add_text("Source File", os.path.basename(input_files[index].name))
+                    metadata.add_text("Image Width", str(result[0].width))
+                    metadata.add_text("Image Height", str(result[0].height))
+                    metadata.add_text("Color Limit", str(num_colors) if color_limit else "None")
+                    metadata.add_text("Quantization Method", quant_method)
+                    metadata.add_text("Dither Method", dither_method)
+                    if result[1]:
+                        metadata.add_text("Palette Info", result[1][:500])  # PNG 텍스트 청크 크기 제한
+                    
+                    result[0].save(os.path.join(folder_name, output_filename), format='PNG', pnginfo=metadata)
+                    palette_filename = output_filename.replace(".png", "_palette.png")
+                    if result[2] is not None:
+                        palette_metadata = PngInfo()
+                        palette_metadata.add_text("Software", "png2gb - Game Boy Image Converter")
+                        palette_metadata.add_text("Creation Time", datetime.now().isoformat())
+                        palette_metadata.add_text("Image Type", "Palette Reference")
+                        palette_metadata.add_text("Image Width", str(result[2].width))
+                        palette_metadata.add_text("Image Height", str(result[2].height))
+                        result[2].save(os.path.join(folder_name, palette_filename), format='PNG', pnginfo=palette_metadata)
                     text_for_palette.append(f"File {index + 1}: {os.path.basename(input_files[index].name)}\n{result[1]}")
                 # zip the folder
                 with zipfile.ZipFile(os.path.join(folder_name, folder_name + ".zip"), 'w') as zipf:
@@ -1393,7 +1537,7 @@ def create_gradio_interface():
                                      noise_factor, edge_enhance, apply_blur, irregular_shape, irregular_size
                                      ],
                              outputs=[image_output, palette_text,
-                                      image_output_no_palette, notice_text])
+                                      image_output_no_palette, notice_text, image_output_png, image_output_palette_png])
 
         execute_button_folder.click(process_image_folder,
                                     inputs=[folder_input, new_width, new_height, keep_aspect_ratio, enable_color_limit,
@@ -1435,4 +1579,5 @@ if __name__ == "__main__":
     start_clearing_temporary_files_timer(interval)
     demo: gr.Blocks = create_gradio_interface()
     # use http basic auth with password of boobiess
-    demo.launch(share=False, server_name="0.0.0.0", server_port=7860)
+    header = '<script async defer data-website-id="f5b8324e-09b2-4d56-8c1f-40a1f1457023" src="https://metrics.prodigle.dev/umami.js"></script>'
+    demo.launch(share=False, server_name="0.0.0.0", server_port=7860, head=header)
